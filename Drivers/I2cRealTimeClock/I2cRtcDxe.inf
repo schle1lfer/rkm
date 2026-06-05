@@ -1,0 +1,42 @@
+## @file
+#  DXE driver: I2C-backed Real Time Clock Arch Protocol
+#
+#  Reads a Unix timestamp from an I2C device and installs
+#  EfiRealTimeClockArchProtocol so that gRT->GetTime() returns
+#  the correct time to UEFI consumers and the Linux kernel.
+##
+
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = I2cRtcDxe
+  FILE_GUID                      = 3A7B1C2D-4E5F-4A6B-8C9D-0E1F2A3B4C5D
+  MODULE_TYPE                    = DXE_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = I2cRtcDxeEntryPoint
+
+[Sources]
+  I2cRtcDxe.c
+  I2cRtcTime.c
+  Include/I2cRtc.h
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  UefiRuntimeServicesTableLib
+  UefiRuntimeLib
+  UefiLib
+  BaseLib
+  BaseMemoryLib
+  DebugLib
+
+[Protocols]
+  gEfiRealTimeClockArchProtocolGuid     ## PRODUCES
+  gEfiI2cMasterProtocolGuid             ## CONSUMES
+
+[Depex]
+  # Wait until the I2C master is available before this driver runs.
+  gEfiI2cMasterProtocolGuid
