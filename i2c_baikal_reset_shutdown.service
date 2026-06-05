@@ -1,0 +1,40 @@
+[Unit]
+# Human-readable name shown in systemctl status and journal output.
+Description=Send I2C CMD_RESET before shutdown or reboot
+
+# Do not pull in default ordering dependencies (sysinit, basic, etc.).
+# This unit runs very late, after most services have already stopped.
+DefaultDependencies=no
+
+# Ensure we run BEFORE the final shutdown/reboot/halt/poweroff targets
+# so the I2C reset happens while the bus is still accessible.
+Before=shutdown.target reboot.target halt.target poweroff.target
+
+# Start only after the network is up (not strictly required for I2C,
+# but avoids ordering conflicts with network-dependent services).
+After=network.target
+
+[Service]
+# oneshot: the process is expected to exit after doing its work.
+# systemd considers the unit active until ExecStop finishes.
+Type=oneshot
+
+# Keep the unit in the "active" state after ExecStart exits so that
+# ExecStop is executed when the unit is stopped (i.e., at shutdown).
+RemainAfterExit=yes
+
+# Nothing to do at start time — the real work happens in ExecStop.
+ExecStart=/bin/true
+
+# Send CMD_RESET via the user-space utility just before shutdown.
+# Arguments: I2C device node, slave address.
+ExecStop=/usr/local/bin/i2c-reset /dev/i2c-2 0x46
+
+# Allow up to 5 seconds for the utility to complete before systemd
+# forcefully proceeds with shutdown.
+TimeoutStopSec=5
+
+[Install]
+# Pull this unit in when the system reaches multi-user (normal) mode,
+# so it is active and ready to run ExecStop at shutdown/reboot.
+WantedBy=multi-user.target
