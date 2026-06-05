@@ -2,13 +2,20 @@
 /*
  * i2c_reset.c — I2C Protocol v1.0 CMD_RESET, kernel reboot notifier
  *
- * Registers a reboot notifier that sends CMD_RESET (0x52) to slave
- * address 0x46 on I2C bus 2 before the system restarts or shuts down.
+ * Registers a reboot notifier that sends CMD_RESET (0x52) to a slave
+ * device before the system restarts or shuts down.
  *
  * Wire transaction (I2C Protocol v1.0, 03/18/2026):
- *   START 0x46+W [0x52] REPEATED-START 0x46+R [STATUS] STOP
+ *   START <addr>+W [0x52] REPEATED-START <addr>+R [STATUS] STOP
  *
  * STATUS codes: 0x00=OK  0x01=ERR  0x02=BUSY  0x03=INVAL
+ *
+ * Module parameters (set at insmod or via /sys/module/i2c_reset/parameters/):
+ *   bus_num   - I2C adapter number (default: 2, corresponds to /dev/i2c-2)
+ *   slave_addr - 7-bit slave address in hex (default: 0x46)
+ *
+ * Example:
+ *   insmod i2c_reset.ko bus_num=2 slave_addr=0x46
  *
  * Design notes:
  *   - The I2C adapter is acquired once at module_init and released at
@@ -23,15 +30,22 @@
 #include <linux/i2c.h>
 #include <linux/init.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/notifier.h>
 #include <linux/reboot.h>
 
 /* -------------------------------------------------------------------------
- * Configuration
+ * Module parameters
  * ---------------------------------------------------------------------- */
 
-#define I2C_RESET_BUS_NUM    2
-#define I2C_RESET_SLAVE_ADDR ((u16)0x46)
+static int  bus_num    = 2;
+static int  slave_addr = 0x46;
+
+module_param(bus_num,    int, 0444);
+MODULE_PARM_DESC(bus_num,    "I2C adapter number (default: 2)");
+
+module_param(slave_addr, int, 0444);
+MODULE_PARM_DESC(slave_addr, "7-bit slave address (default: 0x46)");
 
 /* -------------------------------------------------------------------------
  * I2C Protocol v1.0 constants
@@ -72,7 +86,8 @@ static const char *proto_status_str(u8 status)
 
 /*
  * i2c_proto_reset - perform the CMD_RESET combined write+read transfer.
- * @adap: I2C adapter to use (bus 2)
+ * @adap: I2C adapter to use
+ * @addr: 7-bit slave address
  *
  * Assembles two struct i2c_msg entries and calls i2c_transfer():
  *   msg[0]: write 1 byte  [0x52]
@@ -83,19 +98,19 @@ static const char *proto_status_str(u8 status)
  *
  * Returns 0 on PROTO_STATUS_OK, negative errno on any error.
  */
-static int i2c_proto_reset(struct i2c_adapter *adap)
+static int i2c_proto_reset(struct i2c_adapter *adap, u16 addr)
 {
 	u8 tx = I2C_CMD_RESET;
 	u8 rx = 0xFF;
 	struct i2c_msg msgs[2] = {
 		{
-			.addr  = I2C_RESET_SLAVE_ADDR,
+			.addr  = addr,
 			.flags = 0,        /* write */
 			.len   = 1,
 			.buf   = &tx,
 		},
 		{
-			.addr  = I2C_RESET_SLAVE_ADDR,
+			.addr  = addr,
 			.flags = I2C_M_RD, /* read, repeated START */
 			.len   = 1,
 			.buf   = &rx,
@@ -146,9 +161,9 @@ static int i2c_reset_notify(struct notifier_block *nb,
 	}
 
 	pr_info("i2c_reset: shutdown event %lu — sending CMD_RESET (bus=%d addr=0x%02x)\n",
-		action, I2C_RESET_BUS_NUM, I2C_RESET_SLAVE_ADDR);
+		action, bus_num, slave_addr);
 
-	ret = i2c_proto_reset(i2c_reset_adap);
+	ret = i2c_proto_reset(i2c_reset_adap, (u16)slave_addr);
 	if (ret < 0)
 		pr_err("i2c_reset: CMD_RESET failed: %d\n", ret);
 	else
@@ -170,9 +185,15 @@ static int __init i2c_reset_init(void)
 {
 	int ret;
 
-	i2c_reset_adap = i2c_get_adapter(I2C_RESET_BUS_NUM);
+	if (slave_addr < 0x08 || slave_addr > 0x77) {
+		pr_err("i2c_reset: invalid slave_addr=0x%02x (valid range: 0x08-0x77)\n",
+		       slave_addr);
+		return -EINVAL;
+	}
+
+	i2c_reset_adap = i2c_get_adapter(bus_num);
 	if (!i2c_reset_adap) {
-		pr_err("i2c_reset: i2c-%d adapter not found\n", I2C_RESET_BUS_NUM);
+		pr_err("i2c_reset: i2c-%d adapter not found\n", bus_num);
 		return -ENODEV;
 	}
 
@@ -185,8 +206,7 @@ static int __init i2c_reset_init(void)
 	}
 
 	pr_info("i2c_reset: ready — CMD_RESET will fire on shutdown/reboot "
-		"(bus=%d addr=0x%02x)\n",
-		I2C_RESET_BUS_NUM, I2C_RESET_SLAVE_ADDR);
+		"(bus=%d addr=0x%02x)\n", bus_num, slave_addr);
 	return 0;
 }
 
