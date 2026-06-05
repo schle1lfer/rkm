@@ -1,182 +1,173 @@
-/**
- * Copyright (C) 2026 Denis SHashunkin, LLC Bulat
- * <shashunkin@opk-bulat.ru>
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * i2c_reset.c — I2C Protocol v1.0 kernel module
  *
- * @file i2c_reset.c
- * @brief Kernel module — I2C Protocol v1.0 CMD_RESET
+ * Sends CMD_RESET (0x52) to slave 0x46 on I2C bus 2 on shutdown/reboot
+ * via a reboot notifier. No reset is sent on module init.
  *
- * Replicates the user-space CMD_RESET logic from the i2c project in kernel
- * space.  On module load it performs a single combined I2C transfer to bus 2
- * at slave address 0x46:
- *
- *   START  0x46+W  [0x52]  REPEATED-START  0x46+R  [STATUS]  STOP
- *
- * Protocol (I2C Protocol v1.0 from 03/18/2026):
- *   CMD_RESET (0x52 'R'):
- *     Request:  [CMD]      (1 byte write)
- *     Response: [STATUS]   (1 byte read)
- *
- *   STATUS codes:
- *     0x00  OK    — reset accepted
- *     0x01  ERR   — generic slave-side error
- *     0x02  BUSY  — slave temporarily busy; retry later
- *     0x03  INVAL — unknown command
- *
- * Equivalent user-space call (for reference):
- *   i2c_proto_reset(fd, 0x46, NULL);  // i2c_proto.c
+ * Protocol:
+ *   Write: [0x52]
+ *   Read:  [STATUS]  — 0x00 = OK
  */
 
-#include <linux/delay.h>
-#include <linux/i2c.h>
-#include <linux/init.h>
 #include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/i2c.h>
+#include <linux/reboot.h>
+#include <linux/notifier.h>
 
-/* -------------------------------------------------------------------------
- * Configuration
- * ---------------------------------------------------------------------- */
+#define I2C_BUS		2
+#define I2C_ADDR	0x46
+#define CMD_RESET	0x52
 
-/** I2C bus number — corresponds to /dev/i2c-2 in user space. */
-#define I2C_RESET_BUS_NUM  2
+#define PROTO_STATUS_OK		0x00
 
-/** Slave device address (7-bit). */
-#define I2C_RESET_SLAVE_ADDR  ((u16)0x46)
+/* Protocol status constants */
+static const struct {
+	u8		code;
+	const char	*str;
+} proto_status_table[] = {
+	{ PROTO_STATUS_OK, "OK" },
+};
 
-/* -------------------------------------------------------------------------
- * I2C Protocol v1.0 constants
- * ---------------------------------------------------------------------- */
-
-/** CMD_RESET command byte (ASCII 'R'). */
-#define I2C_CMD_RESET    ((u8)0x52)
-
-/** Protocol STATUS codes returned in the response frame. */
-#define PROTO_STATUS_OK    ((u8)0x00)
-#define PROTO_STATUS_ERR   ((u8)0x01)
-#define PROTO_STATUS_BUSY  ((u8)0x02)
-#define PROTO_STATUS_INVAL ((u8)0x03)
-
-/* -------------------------------------------------------------------------
- * Internal helpers
- * ---------------------------------------------------------------------- */
-
-/**
- * proto_status_str - return a human-readable label for a STATUS byte.
- * @status: one of the PROTO_STATUS_* constants
- */
 static const char *proto_status_str(u8 status)
 {
-	switch (status) {
-	case PROTO_STATUS_OK:    return "OK";
-	case PROTO_STATUS_ERR:   return "ERR (generic slave error)";
-	case PROTO_STATUS_BUSY:  return "BUSY (retry later)";
-	case PROTO_STATUS_INVAL: return "INVAL (unknown command)";
-	default:                 return "UNKNOWN";
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(proto_status_table); i++) {
+		if (proto_status_table[i].code == status)
+			return proto_status_table[i].str;
 	}
+	return "UNKNOWN";
 }
 
-/* -------------------------------------------------------------------------
- * Protocol implementation
- * ---------------------------------------------------------------------- */
-
 /**
- * i2c_proto_reset - send CMD_RESET to the slave over I2C.
- * @adap: kernel I2C adapter (bus)
- * @addr: 7-bit slave address
+ * i2c_proto_reset - Send CMD_RESET and read back STATUS byte.
+ * @client: I2C client to communicate with.
  *
- * Issues a combined write+read transfer identical to the user-space
- * i2c_proto_reset() function:
+ * Performs a combined write+read transfer:
+ *   write 1 byte  [CMD_RESET]
+ *   read  1 byte  [STATUS]
  *
- *   START addr+W [0x52] REPEATED-START addr+R [STATUS] STOP
- *
- * Return:
- *   0       success (PROTO_STATUS_OK received)
- *  -EIO     protocol error (non-OK STATUS from slave)
- *  negative kernel error code on transport failure
+ * Returns 0 on success, negative errno on failure.
  */
-static int i2c_proto_reset(struct i2c_adapter *adap, u16 addr)
+static int i2c_proto_reset(struct i2c_client *client)
 {
-	u8 tx = I2C_CMD_RESET;
-	u8 rx = 0xFF;
-	int ret;
-
+	u8 cmd = CMD_RESET;
+	u8 status = 0xFF;
 	struct i2c_msg msgs[2] = {
 		{
-			.addr  = addr,
-			.flags = 0,        /* write */
-			.len   = 1,
-			.buf   = &tx,
+			.addr	= client->addr,
+			.flags	= 0,
+			.len	= 1,
+			.buf	= &cmd,
 		},
 		{
-			.addr  = addr,
-			.flags = I2C_M_RD, /* read */
-			.len   = 1,
-			.buf   = &rx,
+			.addr	= client->addr,
+			.flags	= I2C_M_RD,
+			.len	= 1,
+			.buf	= &status,
 		},
 	};
+	int ret;
 
-	pr_info("i2c_reset: TX [0x%02x]  (CMD_RESET)\n", tx);
-
-	ret = i2c_transfer(adap, msgs, ARRAY_SIZE(msgs));
-	if (ret < 0) {
-		pr_err("i2c_reset: i2c_transfer error: %d\n", ret);
+	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
+	if (ret < 0)
 		return ret;
-	}
-	if (ret != ARRAY_SIZE(msgs)) {
-		pr_err("i2c_reset: incomplete transfer: %d/%zu messages\n",
-		       ret, ARRAY_SIZE(msgs));
+	if (ret != ARRAY_SIZE(msgs))
 		return -EIO;
-	}
 
-	pr_info("i2c_reset: RX [0x%02x]  (STATUS=%s)\n",
-		rx, proto_status_str(rx));
+	pr_info("i2c_reset: CMD_RESET status=0x%02x (%s)\n",
+		status, proto_status_str(status));
 
-	if (rx != PROTO_STATUS_OK) {
-		pr_err("i2c_reset: slave rejected CMD_RESET, STATUS=0x%02x (%s)\n",
-		       rx, proto_status_str(rx));
-		return -EIO;
-	}
+	if (status != PROTO_STATUS_OK)
+		return -EPROTO;
 
 	return 0;
 }
 
-/* -------------------------------------------------------------------------
- * Module init / exit
- * ---------------------------------------------------------------------- */
+/**
+ * i2c_reset_notify - Reboot notifier callback.
+ *
+ * Fires on SYS_RESTART, SYS_HALT, and SYS_POWER_OFF.
+ * Acquires the i2c-2 adapter, sends CMD_RESET to slave 0x46,
+ * then releases the adapter.
+ */
+static int i2c_reset_notify(struct notifier_block *nb,
+			    unsigned long action, void *data)
+{
+	struct i2c_adapter *adap;
+	struct i2c_client *client;
+	int ret;
+
+	switch (action) {
+	case SYS_RESTART:
+	case SYS_HALT:
+	case SYS_POWER_OFF:
+		break;
+	default:
+		return NOTIFY_DONE;
+	}
+
+	pr_info("i2c_reset: reboot event %lu — sending CMD_RESET to bus=%d addr=0x%02x\n",
+		action, I2C_BUS, I2C_ADDR);
+
+	adap = i2c_get_adapter(I2C_BUS);
+	if (!adap) {
+		pr_err("i2c_reset: failed to get i2c-%d adapter\n", I2C_BUS);
+		return NOTIFY_DONE;
+	}
+
+	client = i2c_new_dummy_device(adap, I2C_ADDR);
+	if (IS_ERR(client)) {
+		pr_err("i2c_reset: failed to create dummy client: %ld\n",
+		       PTR_ERR(client));
+		i2c_put_adapter(adap);
+		return NOTIFY_DONE;
+	}
+
+	ret = i2c_proto_reset(client);
+	if (ret < 0)
+		pr_err("i2c_reset: CMD_RESET failed: %d\n", ret);
+	else
+		pr_info("i2c_reset: CMD_RESET succeeded\n");
+
+	i2c_unregister_device(client);
+	i2c_put_adapter(adap);
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block i2c_reset_nb = {
+	.notifier_call	= i2c_reset_notify,
+	.priority	= 0,
+};
 
 static int __init i2c_reset_init(void)
 {
-	struct i2c_adapter *adap;
 	int ret;
 
-	pr_info("i2c_reset: loading — bus=%d  slave=0x%02x\n",
-		I2C_RESET_BUS_NUM, I2C_RESET_SLAVE_ADDR);
-
-	adap = i2c_get_adapter(I2C_RESET_BUS_NUM);
-	if (!adap) {
-		pr_err("i2c_reset: i2c-%d adapter not found\n", I2C_RESET_BUS_NUM);
-		return -ENODEV;
-	}
-
-	ret = i2c_proto_reset(adap, I2C_RESET_SLAVE_ADDR);
-	i2c_put_adapter(adap);
-
-	if (ret < 0) {
-		pr_err("i2c_reset: CMD_RESET failed: %d\n", ret);
+	ret = register_reboot_notifier(&i2c_reset_nb);
+	if (ret) {
+		pr_err("i2c_reset: failed to register reboot notifier: %d\n", ret);
 		return ret;
 	}
 
-	pr_info("i2c_reset: CMD_RESET completed successfully\n");
+	pr_info("i2c_reset: registered reboot notifier — CMD_RESET will run on shutdown/reboot\n");
 	return 0;
 }
 
 static void __exit i2c_reset_exit(void)
 {
-	pr_info("i2c_reset: unloaded\n");
+	unregister_reboot_notifier(&i2c_reset_nb);
+	pr_info("i2c_reset: reboot notifier unregistered\n");
 }
 
 module_init(i2c_reset_init);
 module_exit(i2c_reset_exit);
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Denis SHashunkin <shashunkin@opk-bulat.ru>");
-MODULE_DESCRIPTION("I2C Protocol v1.0 CMD_RESET — kernel-space implementation");
-MODULE_VERSION("1.0");
+MODULE_LICENSE("GPL v2");
+MODULE_AUTHOR("schle1lfer");
+MODULE_DESCRIPTION("Send I2C CMD_RESET to 0x46 on bus 2 on shutdown/reboot (reboot notifier)");
+MODULE_VERSION("2.0");
