@@ -11,7 +11,7 @@
  * STATUS codes: 0x00=OK  0x01=ERR  0x02=BUSY  0x03=INVAL
  *
  * Module parameters (set at insmod or via /sys/module/i2c_reset/parameters/):
- *   bus_num   - I2C adapter number (default: 2, corresponds to /dev/i2c-2)
+ *   bus_num    - I2C adapter number (default: 2, corresponds to /dev/i2c-2)
  *   slave_addr - 7-bit slave address in hex (default: 0x46)
  *
  * Example:
@@ -34,12 +34,14 @@
 #include <linux/notifier.h>
 #include <linux/reboot.h>
 
+#define DRV_NAME "i2c_reset"
+
 /* -------------------------------------------------------------------------
  * Module parameters
  * ---------------------------------------------------------------------- */
 
-static int  bus_num    = 2;
-static int  slave_addr = 0x46;
+static int bus_num    = 2;
+static int slave_addr = 0x46;
 
 module_param(bus_num,    int, 0444);
 MODULE_PARM_DESC(bus_num,    "I2C adapter number (default: 2)");
@@ -77,6 +79,16 @@ static const char *proto_status_str(u8 status)
 	case PROTO_STATUS_BUSY:  return "BUSY (retry later)";
 	case PROTO_STATUS_INVAL: return "INVAL (unknown command)";
 	default:                 return "UNKNOWN";
+	}
+}
+
+static const char *reboot_action_str(unsigned long action)
+{
+	switch (action) {
+	case SYS_RESTART:   return "SYS_RESTART";
+	case SYS_HALT:      return "SYS_HALT";
+	case SYS_POWER_OFF: return "SYS_POWER_OFF";
+	default:            return "UNKNOWN";
 	}
 }
 
@@ -118,27 +130,30 @@ static int i2c_proto_reset(struct i2c_adapter *adap, u16 addr)
 	};
 	int ret;
 
-	pr_info("i2c_reset: TX [0x%02x] (CMD_RESET)\n", tx);
+	pr_info(DRV_NAME ": transfer start: bus=i2c-%d addr=0x%02x\n",
+		bus_num, addr);
+	pr_info(DRV_NAME ": TX [0x%02x] (CMD_RESET 'R')\n", tx);
 
 	ret = i2c_transfer(adap, msgs, ARRAY_SIZE(msgs));
 	if (ret < 0) {
-		pr_err("i2c_reset: i2c_transfer error: %d\n", ret);
+		pr_err(DRV_NAME ": i2c_transfer failed (err=%d)\n", ret);
 		return ret;
 	}
 	if (ret != ARRAY_SIZE(msgs)) {
-		pr_err("i2c_reset: incomplete transfer (%d/%zu messages)\n",
+		pr_err(DRV_NAME ": incomplete transfer: %d/%zu messages sent\n",
 		       ret, ARRAY_SIZE(msgs));
 		return -EIO;
 	}
 
-	pr_info("i2c_reset: RX STATUS=0x%02x (%s)\n", rx, proto_status_str(rx));
+	pr_info(DRV_NAME ": RX [0x%02x] STATUS=%s\n", rx, proto_status_str(rx));
 
 	if (rx != PROTO_STATUS_OK) {
-		pr_err("i2c_reset: slave rejected CMD_RESET: STATUS=0x%02x (%s)\n",
+		pr_err(DRV_NAME ": CMD_RESET rejected by slave: STATUS=0x%02x (%s)\n",
 		       rx, proto_status_str(rx));
 		return -EPROTO;
 	}
 
+	pr_info(DRV_NAME ": CMD_RESET accepted by slave\n");
 	return 0;
 }
 
@@ -157,17 +172,21 @@ static int i2c_reset_notify(struct notifier_block *nb,
 	case SYS_POWER_OFF:
 		break;
 	default:
+		pr_debug(DRV_NAME ": ignoring reboot event %lu\n", action);
 		return NOTIFY_DONE;
 	}
 
-	pr_info("i2c_reset: shutdown event %lu — sending CMD_RESET (bus=%d addr=0x%02x)\n",
-		action, bus_num, slave_addr);
+	pr_info(DRV_NAME ": reboot notifier fired: action=%s (%lu)\n",
+		reboot_action_str(action), action);
+	pr_info(DRV_NAME ": sending CMD_RESET to bus=i2c-%d addr=0x%02x\n",
+		bus_num, slave_addr);
 
 	ret = i2c_proto_reset(i2c_reset_adap, (u16)slave_addr);
 	if (ret < 0)
-		pr_err("i2c_reset: CMD_RESET failed: %d\n", ret);
+		pr_err(DRV_NAME ": CMD_RESET failed (err=%d) — continuing shutdown\n",
+		       ret);
 	else
-		pr_info("i2c_reset: CMD_RESET OK\n");
+		pr_info(DRV_NAME ": CMD_RESET completed successfully\n");
 
 	return NOTIFY_DONE;
 }
@@ -185,36 +204,48 @@ static int __init i2c_reset_init(void)
 {
 	int ret;
 
+	pr_info(DRV_NAME ": initializing (bus_num=%d slave_addr=0x%02x)\n",
+		bus_num, slave_addr);
+
 	if (slave_addr < 0x08 || slave_addr > 0x77) {
-		pr_err("i2c_reset: invalid slave_addr=0x%02x (valid range: 0x08-0x77)\n",
-		       slave_addr);
+		pr_err(DRV_NAME ": invalid slave_addr=0x%02x "
+		       "(valid 7-bit range: 0x08-0x77)\n", slave_addr);
 		return -EINVAL;
 	}
 
+	pr_info(DRV_NAME ": requesting i2c-%d adapter\n", bus_num);
 	i2c_reset_adap = i2c_get_adapter(bus_num);
 	if (!i2c_reset_adap) {
-		pr_err("i2c_reset: i2c-%d adapter not found\n", bus_num);
+		pr_err(DRV_NAME ": i2c-%d adapter not found — "
+		       "is the bus driver loaded?\n", bus_num);
 		return -ENODEV;
 	}
+	pr_info(DRV_NAME ": got adapter \"%s\"\n", i2c_reset_adap->name);
 
+	pr_info(DRV_NAME ": registering reboot notifier\n");
 	ret = register_reboot_notifier(&i2c_reset_nb);
 	if (ret) {
-		pr_err("i2c_reset: register_reboot_notifier failed: %d\n", ret);
+		pr_err(DRV_NAME ": register_reboot_notifier failed (err=%d)\n",
+		       ret);
 		i2c_put_adapter(i2c_reset_adap);
 		i2c_reset_adap = NULL;
 		return ret;
 	}
 
-	pr_info("i2c_reset: ready — CMD_RESET will fire on shutdown/reboot "
-		"(bus=%d addr=0x%02x)\n", bus_num, slave_addr);
+	pr_info(DRV_NAME ": ready — CMD_RESET will fire on shutdown/reboot "
+		"(bus=i2c-%d addr=0x%02x)\n", bus_num, slave_addr);
 	return 0;
 }
 
 static void __exit i2c_reset_exit(void)
 {
+	pr_info(DRV_NAME ": unloading — unregistering reboot notifier\n");
 	unregister_reboot_notifier(&i2c_reset_nb);
+
+	pr_info(DRV_NAME ": releasing i2c-%d adapter\n", bus_num);
 	i2c_put_adapter(i2c_reset_adap);
-	pr_info("i2c_reset: unloaded\n");
+
+	pr_info(DRV_NAME ": unloaded\n");
 }
 
 module_init(i2c_reset_init);
