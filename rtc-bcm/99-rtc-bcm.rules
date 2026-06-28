@@ -1,0 +1,14 @@
+# /etc/udev/rules.d/99-rtc-bcm.rules
+#
+# Creates /dev/rtc_bcm0 as a symlink to the RTC device registered by the
+# rtc-bcm driver.  The kernel RTC subsystem always assigns /dev/rtcN names;
+# this rule provides the stable, driver-specific name expected by applications.
+#
+# The match key ATTR{name} contains the string returned by the driver's
+# rtc_class_ops name, which equals the MODULE name "rtc-bcm".
+#
+# To verify after insmod:
+#   udevadm info /dev/rtc0
+#   ls -la /dev/rtc_bcm0
+
+SUBSYSTEM=="rtc", ATTR{name}=="rtc-bcm", SYMLINK+="rtc_bcm0"
