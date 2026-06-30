@@ -365,3 +365,152 @@ configurations it carries one itself.
 - **The kernel prefers an externally supplied DTB**, which is exactly why
   replacing a board's device tree is usually a bootloader-config change rather
   than a kernel rebuild.
+
+---
+
+## 6. Is the device tree compiled? — and how to overlay it
+
+Two practical questions per project: **(a)** how do I tell whether a device
+tree has actually been compiled (a real `.dtb`/FDT exists), and **(b)** how do
+I apply an overlay to it.
+
+### 6.0 Generic checks (work everywhere)
+
+A compiled DTB (FDT) is binary and self-identifying, so independent of project:
+
+```sh
+file board.dtb
+# → board.dtb: Device Tree Blob version 17, size=..., boot cpu=...
+
+xxd -l 4 board.dtb        # first 4 bytes are the FDT magic
+# → d00dfeed                (0xd00dfeed, big-endian)
+
+fdtdump board.dtb | head            # human-readable dump (from dtc package)
+dtc -I dtb -O dts board.dtb         # decompile; succeeds ⇒ it is a valid DTB
+```
+
+If the file is ASCII text it is still source (`.dts`/`.dtsi`), i.e. **not**
+compiled. If `dtc -I dtb` or `fdtdump` parses it, it is compiled.
+
+The generic overlay tool (offline, no running system) is `fdtoverlay`:
+
+```sh
+# Pre-merge an overlay into a base DTB, producing a new merged blob:
+fdtoverlay -i base.dtb -o merged.dtb overlay.dtbo
+# Compile an overlay source (note: needs the overlay plugin syntax / -@):
+dtc -@ -I dts -O dtb -o overlay.dtbo overlay.dts
+```
+
+(`-@` makes `dtc` emit the `__symbols__` node that overlays need to resolve
+phandle targets in the base tree.)
+
+### 6.1 UEFI (EDK2)
+
+**Compiled?**
+- *Build time:* search the EDK2 build output for the blob and confirm it was
+  packed into a Firmware Volume:
+  ```sh
+  find Build/<Platform>/<TARGET>_<TOOLCHAIN>/ -name '*.dtb'
+  # and check the FV map for the FDT FFS GUID:
+  grep -i fdt Build/<Platform>/.../FV/*.Fv.txt
+  ```
+  The `.fdf` referencing the `.dtb` and a non-empty blob in `Build/` means it
+  was compiled and embedded.
+- *Run time:* there is no DT in pure ACPI mode. To see whether UEFI published a
+  DTB, check after boot on Linux: `ls -l /sys/firmware/fdt` exists ⇒ a DTB was
+  handed over (and `dmesg | grep -i 'DTB\|EFI.*fdt'` shows whether it came from
+  the EFI configuration table). On platforms with `DtPlatformDxe`, the
+  ACPI-vs-DT choice is a setup-screen / `DtAcpiPref` variable.
+
+**Overlay?** EDK2 has no general "apply overlay" command. You either:
+- merge the overlay into the embedded base **offline** with `fdtoverlay` and
+  re-embed it (rebuild firmware), or
+- let a downstream stage (U-Boot / kernel configfs) do the overlay after UEFI
+  hands the base DTB over.
+
+### 6.2 GRUB2
+
+**Compiled?** GRUB only consumes a prebuilt blob, so "compiled" = the file is a
+valid FDT — verify with the generic checks (`file` / `fdtdump`). Also confirm
+GRUB can *do* device trees at all:
+```
+grub> lsmod              # is the 'fdt' module loaded?
+grub> insmod fdt
+grub> devicetree         # command exists ⇒ supported (errors if file missing)
+```
+A successful `devicetree /path/board.dtb` with no error means the blob was
+loaded and installed into the EFI config table.
+
+**Overlay?** GRUB has **no** overlay-apply command. Pre-merge with `fdtoverlay`
+(Section 6.0) and point `devicetree` at the merged blob.
+
+### 6.3 U-Boot
+
+**Compiled?**
+- *Build time:* the control DTB appears as `u-boot.dtb` (and is folded into
+  `u-boot-dtb.bin`) in the build directory — its presence ⇒ compiled.
+- *Run time:* U-Boot exposes the control DTB address and lets you validate any
+  blob's header:
+  ```
+  => bdinfo                      # shows 'fdt_blob' = control DTB address
+  => printenv fdtcontroladdr     # env var pointing at the control DTB
+  => fdt addr ${fdtcontroladdr}
+  => fdt header                  # prints magic/size ⇒ confirms a valid FDT
+  => fdt print /                 # dump the tree
+  ```
+  For the OS DTB: `load`/`tftp` it to `${fdt_addr_r}`, then
+  `fdt addr ${fdt_addr_r}; fdt header` — a sane magic/size means it compiled OK.
+
+**Overlay?** U-Boot applies overlays live with the `fdt` command:
+```
+=> load mmc 0:1 ${fdt_addr_r} board.dtb        # base DTB into RAM
+=> fdt addr ${fdt_addr_r}
+=> fdt resize 8192                              # make room for the overlay
+=> load mmc 0:1 ${overlay_addr_r} ov.dtbo      # overlay into RAM
+=> fdt apply ${overlay_addr_r}                  # merge it onto the base
+=> booti ${kernel_addr_r} - ${fdt_addr_r}       # boot with the patched DTB
+```
+(FIT images can also list overlays in a `configuration` so they are applied
+automatically; `CONFIG_OF_LIBFDT_OVERLAY` must be enabled for `fdt apply`.)
+
+### 6.4 Linux kernel
+
+**Compiled?**
+- *Build time:* after `make dtbs`, the blob exists next to the source, e.g.
+  `arch/arm64/boot/dts/<vendor>/<board>.dtb`. Check with the generic tools.
+  Confirm DT support is even configured:
+  ```sh
+  zcat /proc/config.gz | grep -E 'CONFIG_OF(_OVERLAY)?='
+  ```
+- *Run time (is the running kernel actually on a DT?):* these exist only when
+  booted with a device tree —
+  ```sh
+  ls -l /sys/firmware/fdt                       # the raw FDT handed in
+  ls /proc/device-tree/                         # = /sys/firmware/devicetree/base/
+  cat /sys/firmware/devicetree/base/model       # human-readable board model
+  ```
+  If `/proc/device-tree` is absent, the system is running on ACPI (or no DT).
+
+**Overlay?**
+- *Live, via configfs* (needs `CONFIG_OF_OVERLAY` and the configfs mount):
+  ```sh
+  mkdir -p /sys/kernel/config/device-tree/overlays/myov
+  cat ov.dtbo > /sys/kernel/config/device-tree/overlays/myov/dtbo
+  cat /sys/kernel/config/device-tree/overlays/myov/status   # → "applied"
+  # remove again:
+  rmdir /sys/kernel/config/device-tree/overlays/myov
+  ```
+- *Offline:* merge with `fdtoverlay` (Section 6.0) and boot the merged blob, or
+  let the bootloader apply it (U-Boot `fdt apply`, Section 6.3).
+- Note: not every node is "overlayable" at run time — devices already probed or
+  outside the overlay's target may need the merge-then-reboot approach instead.
+
+### 6.5 Quick reference
+
+| | Verify "compiled?" | Apply an overlay |
+|---|---|---|
+| **Generic** | `file x.dtb`, `xxd -l4` = `d00dfeed`, `fdtdump`, `dtc -I dtb` | `fdtoverlay -i base.dtb -o merged.dtb ov.dtbo` |
+| **UEFI** | blob in `Build/.../*.dtb` + FV map; runtime `/sys/firmware/fdt` | none in EDK2 — pre-merge & re-embed, or overlay downstream |
+| **GRUB2** | `file`/`fdtdump` on the blob; `lsmod`/`insmod fdt`; `devicetree` runs | none — pre-merge with `fdtoverlay` |
+| **U-Boot** | `u-boot.dtb` in build; `bdinfo`, `fdt addr ${fdtcontroladdr}; fdt header` | `fdt addr` → `fdt resize` → `fdt apply ${ov}` (or FIT) |
+| **Linux** | `make dtbs` output; `/proc/device-tree`, `/sys/firmware/fdt` | configfs `overlays/` dir (`CONFIG_OF_OVERLAY`), or offline merge |
